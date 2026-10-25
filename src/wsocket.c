@@ -8,6 +8,7 @@
 #include "luasocket.h"
 
 #include <string.h>
+#include <stdlib.h>
 
 #include "socket.h"
 #include "pierror.h"
@@ -47,12 +48,41 @@ int socket_close(void) {
 #define WAITFD_E        4
 #define WAITFD_C        (WAITFD_E|WAITFD_W)
 
+#if _WIN32_WINNT >= 0x0600
+#define LUASOCKET_USE_WSAPOLL 1
+#else
+#define LUASOCKET_USE_WSAPOLL 0
+#endif
+
+/*-------------------------------------------------------------------------*\
+ * Wait for readable/writable/connected socket with timeout
+ *
+ * WSAPoll is used on Vista+ (_WIN32_WINNT >= 0x0600): cost is proportional
+ * to the number of ready descriptors, not the total watch size, and there
+ * is no FD_SETSIZE limit. Older Windows falls back to select(2).
+ \*-------------------------------------------------------------------------*/
 int socket_waitfd(p_socket ps, int sw, p_timeout tm) {
     int ret;
-    fd_set rfds, wfds, efds, *rp = NULL, *wp = NULL, *ep = NULL;
-    struct timeval tv, *tp = NULL;
     double t;
     if (timeout_iszero(tm)) return IO_TIMEOUT;  /* optimize timeout == 0 case */
+#if LUASOCKET_USE_WSAPOLL
+    WSAPOLLFD pfd;
+    int ms;
+    pfd.fd = *ps;
+    pfd.events = 0;
+    if (sw & WAITFD_R) pfd.events |= POLLIN;
+    if (sw & WAITFD_W) pfd.events |= POLLOUT;
+    t = timeout_get(tm);
+    ms = t >= 0.0 ? (int)(t * 1e3) : -1;
+    ret = WSAPoll(&pfd, 1, ms);
+    if (ret == -1) return WSAGetLastError();
+    if (ret == 0) return IO_TIMEOUT;
+    if (sw == WAITFD_C && (pfd.revents & (POLLERR | POLLHUP)))
+        return IO_CLOSED;
+    return IO_DONE;
+#else
+    fd_set rfds, wfds, efds, *rp = NULL, *wp = NULL, *ep = NULL;
+    struct timeval tv, *tp = NULL;
     if (sw & WAITFD_R) {
         FD_ZERO(&rfds);
         FD_SET(*ps, &rfds);
@@ -70,13 +100,108 @@ int socket_waitfd(p_socket ps, int sw, p_timeout tm) {
     if (ret == 0) return IO_TIMEOUT;
     if (sw == WAITFD_C && FD_ISSET(*ps, &efds)) return IO_CLOSED;
     return IO_DONE;
+#endif
 }
 
 /*-------------------------------------------------------------------------*\
-* Select with int timeout in ms
-\*-------------------------------------------------------------------------*/
+ * Select with timeout control
+ *
+ * Winsock's select(2) is O(FD_SETSIZE) and capped by FD_SETSIZE. On
+ * Vista+ we use WSAPoll, which is O(ready descriptors) and has no
+ * FD_SETSIZE limit. Older Windows falls back to select(2).
+ \*-------------------------------------------------------------------------*/
 int socket_select(t_socket n, fd_set *rfds, fd_set *wfds, fd_set *efds,
         p_timeout tm) {
+#if LUASOCKET_USE_WSAPOLL
+    int ret, i, nfds = 0, nready = 0;
+    double t;
+    int ms;
+    WSAPOLLFD *pfds;
+    (void) n;  /* Winsock ignores nfds; we scan the fd_sets directly */
+
+    t = timeout_get(tm);
+    ms = t >= 0.0 ? (int)(t * 1e3) : -1;
+
+    if (n <= 0) {
+        Sleep((DWORD) (1000*t));
+        return 0;
+    }
+
+    /* upper bound on unique sockets across the three sets */
+    {
+        int count = 0;
+        if (rfds) count += (int) rfds->fd_count;
+        if (wfds) count += (int) wfds->fd_count;
+        if (efds) count += (int) efds->fd_count;
+        nfds = count;
+    }
+
+    pfds = (WSAPOLLFD *) malloc(sizeof(WSAPOLLFD) * (size_t) nfds);
+    if (!pfds) return WSAENOBUFS;
+
+    nfds = 0;
+    /* add each watched socket to the poll array, merging interest bits
+     * when a socket appears in more than one set */
+    for (i = 0; i < 3; i++) {
+        fd_set *set;
+        short evbit;
+        switch (i) {
+            case 0: set = rfds; evbit = POLLIN; break;
+            case 1: set = wfds; evbit = POLLOUT; break;
+            default: set = efds; evbit = POLLERR; break;
+        }
+        if (!set) continue;
+        for (int k = 0; k < (int) set->fd_count; k++) {
+            SOCKET s = set->fd_array[k];
+            int found = 0;
+            for (int m = 0; m < nfds; m++) {
+                if (pfds[m].fd == s) {
+                    pfds[m].events |= evbit;
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found) {
+                pfds[nfds].fd = s;
+                pfds[nfds].events = evbit;
+                nfds++;
+            }
+        }
+    }
+
+    /* clear the fd sets; they will be repopulated with ready sockets */
+    if (rfds) FD_ZERO(rfds);
+    if (wfds) FD_ZERO(wfds);
+    if (efds) FD_ZERO(efds);
+
+    if (nfds == 0) {
+        if (ms > 0) Sleep((DWORD) ms);
+        free(pfds);
+        return 0;
+    }
+
+    ret = WSAPoll(pfds, (ULONG) nfds, ms);
+    if (ret == -1) {
+        free(pfds);
+        return -1;
+    }
+    if (ret == 0) {
+        free(pfds);
+        return 0;
+    }
+
+    /* repopulate fd sets with ready sockets */
+    for (i = 0; i < nfds; i++) {
+        SOCKET s = pfds[i].fd;
+        short re = pfds[i].revents;
+        if (rfds && (re & (POLLIN | POLLERR | POLLHUP))) FD_SET(s, rfds);
+        if (wfds && (re & POLLOUT)) FD_SET(s, wfds);
+        if (efds && (re & POLLERR)) FD_SET(s, efds);
+    }
+    nready = ret;
+    free(pfds);
+    return nready;
+#else
     struct timeval tv;
     double t = timeout_get(tm);
     tv.tv_sec = (int) t;
@@ -85,6 +210,7 @@ int socket_select(t_socket n, fd_set *rfds, fd_set *wfds, fd_set *efds,
         Sleep((DWORD) (1000*t));
         return 0;
     } else return select(0, rfds, wfds, efds, t >= 0.0? &tv: NULL);
+#endif
 }
 
 /*-------------------------------------------------------------------------*\

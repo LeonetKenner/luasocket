@@ -185,7 +185,7 @@ CFLAGS_linux=$(LUAINC:%=-I%) $(DEF) -Wall -Wshadow -Wextra \
 	-Wimplicit -O2 -ggdb3 -fpic
 LDFLAGS_linux=-O -shared -fpic -o
 LD_linux=gcc
-SOCKET_linux=usocket.o
+SOCKET_linux=epoll.o
 
 #------
 # Compiler and linker settings
@@ -198,7 +198,7 @@ CFLAGS_freebsd=$(LUAINC:%=-I%) $(DEF) -Wall -Wshadow -Wextra \
 	-Wimplicit -O2 -ggdb3 -fpic
 LDFLAGS_freebsd=-O -shared -fpic -o
 LD_freebsd=gcc
-SOCKET_freebsd=usocket.o
+SOCKET_freebsd=kqueue.o
 
 #------
 # Compiler and linker settings
@@ -220,7 +220,8 @@ SO_mingw=dll
 O_mingw=o
 CC_mingw=gcc
 DEF_mingw= -DLUASOCKET_$(DEBUG) \
-	-DWINVER=0x0501
+	-DWINVER=0x0501 \
+	-D _WIN32_WINNT=0x0600
 CFLAGS_mingw=$(LUAINC:%=-I%) $(DEF) -Wall -O2 -fno-common
 LDFLAGS_mingw= $(LUALIB) -shared -Wl,-s -lws2_32 -o
 LD_mingw=gcc
@@ -233,13 +234,20 @@ SO_ucrt64=dll
 O_ucrt64=o
 CC_ucrt64=gcc
 DEF_ucrt64= -DLUASOCKET_$(DEBUG) \
-	-DWINVER=0x0501
+	-DWINVER=0x0501 \
+	-D _WIN32_WINNT=0x0600
 CFLAGS_ucrt64= -I$(LUAINC) $(DEF) -Wall -O2 -fno-common
 # \
 	-fvisibility=hidden
 LDFLAGS_ucrt64= $(LUALIB) -shared -Wl,-s -lws2_32 -o
 LD_ucrt64=gcc
 SOCKET_ucrt64=wsocket.o
+
+# object implementing the blocking wait primitives (socket_waitfd /
+# socket_select): epoll on Linux, usocket (poll/select) everywhere else
+WAIT_OBJ=$(or $(WAIT_OBJ_$(PLAT)),usocket.$(O))
+WAIT_OBJ_linux=epoll.$(O)
+WAIT_OBJ_freebsd=kqueue.$(O)
 
 
 #------
@@ -251,6 +259,7 @@ CC_win32=cl
 DEF_win32= //D "WIN32" //D "NDEBUG" //D "_WINDOWS" //D "_USRDLL" \
      //D "_CRT_SECURE_NO_WARNINGS" \
      //D "_WINDLL"  \
+     //D "_WIN32_WINNT=0x0600" \
      //D "LUASOCKET_$(DEBUG)"
 CFLAGS_win32=$(LUAINC:%=//I "%") $(DEF) //O2 //Ot //MD //W3 //nologo
 LDFLAGS_win32= //nologo //link //NOLOGO //DLL //INCREMENTAL:NO \
@@ -272,6 +281,7 @@ CC_win64=cl
 DEF_win64= //D "WIN32" //D "NDEBUG" //D "_WINDOWS" //D "_USRDLL" \
      //D "_CRT_SECURE_NO_WARNINGS" \
      //D "_WINDLL"  \
+     //D "_WIN32_WINNT=0x0600" \
      //D "LUASOCKET_$(DEBUG)"
 CFLAGS_win64=$(LUAINC:%=//I "%") $(DEF) //O2 //Ot //MD //W3 //nologo
 LDFLAGS_win64= //nologo //link //NOLOGO //DLL //INCREMENTAL:NO \
@@ -347,7 +357,7 @@ UNIX_OBJS=\
 	options.$(O) \
 	timeout.$(O) \
 	io.$(O) \
-	usocket.$(O) \
+	$(WAIT_OBJ) \
 	unixstream.$(O) \
 	unixdgram.$(O) \
 	compat.$(O) \
@@ -363,7 +373,7 @@ SERIAL_OBJS=\
 	options.$(O) \
 	timeout.$(O) \
 	io.$(O) \
-	usocket.$(O) \
+	$(WAIT_OBJ) \
 	serial.$(O)
 
 #------
@@ -483,4 +493,6 @@ udp.$(O): udp.c auxiliar.h socket.h io.h timeout.h usocket.h \
 unix.$(O): unix.c auxiliar.h socket.h io.h timeout.h usocket.h \
 	options.h unix.h buffer.h
 usocket.$(O): usocket.c socket.h io.h timeout.h usocket.h
+epoll.$(O): epoll.c socket.h io.h timeout.h
+kqueue.$(O): kqueue.c socket.h io.h timeout.h
 wsocket.$(O): wsocket.c socket.h io.h timeout.h usocket.h
